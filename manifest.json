@@ -1,0 +1,13 @@
+{
+    "display_name": "Typing Expand",
+    "loading_order": 50,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "hydravnss",
+    "version": "1.0.0",
+    "homePage": "https://github.com/hydravnss/typing-expand",
+    "minimum_client_version": "1.12.0",
+    "description": "FR: Cache les boutons à gauche de la zone de saisie (menu, baguette magique, pièce jointe, avatar...) quand on écrit, pour que le champ de texte s'étende sur toute la largeur. EN: Collapses the buttons left of the chat input while typing so the textarea expands horizontally."
+}
