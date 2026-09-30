@@ -1,8 +1,9 @@
 /**
  * Typing Expand - extension SillyTavern
  * Cache les boutons à gauche de la zone de saisie (#leftSendForm, menu, baguette magique, pièce jointe, avatar...)
- * pendant qu'on écrit, pour que #send_textarea occupe toute la largeur. Les boutons reviennent quand le champ
- * perd le focus ET est vide (ou après l'envoi).
+ * pendant qu'on écrit, pour que #send_textarea occupe toute la largeur. Par défaut : cachés dès qu'il y a du texte,
+ * restaurés dès que le champ redevient vide (même s'il garde le focus / clavier iOS ouvert). Option « Cacher dès le
+ * focus » : cachés dès le focus, restaurés quand le texte est effacé, sans re-cacher avant la prochaine saisie.
  *
  * Mécanisme : la classe `te-typing` est posée sur #send_form ; les règles CSS (très spécifiques + !important)
  * sont injectées dans <style id="typing-expand-style"> pour l'emporter sur un thème personnalisé.
@@ -24,6 +25,7 @@ const CHEVRON_ID = 'te_chevron';
 const CLS_TYPING = 'te-typing';
 const CLS_LEFT = 'te-hide-left';
 const BLUR_DELAY_MS = 80;
+const POLL_MS = 250;
 const SMALL_SCREEN_QUERY = '(max-width: 1000px)';
 
 const DEFAULT_SELECTORS = '#leftSendForm\n#options_button\n#extensionsMenuButton';
@@ -32,7 +34,8 @@ const DEFAULT_EXCLUDE = '#qr--bar\n#file_form';
 
 const defaultSettings = Object.freeze({
     enabled: true,
-    keepWhileText: true, // garder cachés tant qu'il y a du texte (sinon : seulement pendant le focus)
+    keepWhileText: true, // garder cachés tant qu'il y a du texte, même sans focus (sinon : seulement texte + focus)
+    hideOnFocus: false, // « Cacher dès le focus » : cacher dès le focus même si le champ est vide
     autoDetect: true, // frères précédents du textarea
     selectors: DEFAULT_SELECTORS,
     exclude: DEFAULT_EXCLUDE,
@@ -95,13 +98,16 @@ function sanitizeSelectors(text, validate) {
 /**
  * Doit-on cacher les boutons de gauche ?
  * state : { focused, hasText, sentReset, forced }
+ * - défaut : caché si du texte (et, si keepWhileText est faux, seulement pendant le focus) ; champ vide => visibles.
+ * - hideOnFocus : caché aussi dès le focus, sauf si le texte vient d'être effacé (sentReset) jusqu'à la prochaine saisie.
  */
 function computeBaseHide(s, state, isSmall) {
     if (!s.enabled) return false;
     if (s.onlySmall && !isSmall) return false;
-    const focusActive = !!state.focused && !state.sentReset;
-    const textActive = !!s.keepWhileText && !!state.hasText;
-    return focusActive || textActive;
+    const hasText = !!state.hasText;
+    const textActive = hasText && (!!s.keepWhileText || !!state.focused);
+    const focusActive = !!s.hideOnFocus && !!state.focused && !state.sentReset;
+    return textActive || focusActive;
 }
 
 function computeHide(s, state, isSmall) {
@@ -175,7 +181,7 @@ function getSettings() {
     for (const [key, value] of Object.entries(defaultSettings)) {
         if (s[key] === undefined) s[key] = value; // fusion des valeurs par défaut
     }
-    for (const k of ['enabled', 'keepWhileText', 'autoDetect', 'chevron', 'onlySmall']) s[k] = !!s[k];
+    for (const k of ['enabled', 'keepWhileText', 'hideOnFocus', 'autoDetect', 'chevron', 'onlySmall']) s[k] = !!s[k];
     if (typeof s.selectors !== 'string') s.selectors = DEFAULT_SELECTORS;
     if (typeof s.exclude !== 'string') s.exclude = DEFAULT_EXCLUDE;
     s.duration = clampNumber(s.duration, defaultSettings.duration, 0, 500);
@@ -209,7 +215,7 @@ const validateSelector = (sel) => {
 };
 const hasTextNow = () => {
     const ta = getTextarea();
-    return !!ta && String(ta.value || '').length > 0;
+    return !!ta && String(ta.value || '').trim().length > 0;
 };
 
 function getSelectorList() {
@@ -367,7 +373,12 @@ function update() {
         const ta = getTextarea();
         if (!form || !ta) return;
         const s = getSettings();
+        const had = state.hasText;
         state.hasText = hasTextNow();
+        // Texte effacé (saisie, couper, envoi, valeur remise à zéro) : on restaure tout de suite, même avec le focus,
+        // et on ne re-cache pas (option « dès le focus ») avant la prochaine saisie de texte.
+        if (had && !state.hasText) state.sentReset = true;
+        else if (state.hasText) state.sentReset = false;
         const small = isSmallScreen();
         const base = computeBaseHide(s, state, small);
         if (!base) state.forced = false;
@@ -434,11 +445,20 @@ function bindListeners() {
             update();
         }, BLUR_DELAY_MS);
     });
-    document.addEventListener('input', (e) => {
+    // Le texte peut changer sans 'input' fiable sur iOS : on écoute large. cut/paste/composition : la valeur est
+    // mise à jour après l'événement, d'où la relecture différée.
+    const onChange = (e) => {
         if (!isTa(e.target)) return;
-        state.sentReset = false;
         update();
-    });
+    };
+    const onChangeDeferred = (e) => {
+        if (!isTa(e.target)) return;
+        update();
+        setTimeout(update, 0);
+        setTimeout(update, 60);
+    };
+    for (const type of ['input', 'keyup', 'change']) document.addEventListener(type, onChange);
+    for (const type of ['cut', 'paste', 'compositionend']) document.addEventListener(type, onChangeDeferred);
     // Envoi sans événement ST (clic sur le bouton / Entrée) : le champ est vidé sans événement 'input'
     document.addEventListener('click', (e) => {
         if (e.target && e.target.closest && e.target.closest('#send_but')) scheduleAfterSend();
@@ -451,12 +471,16 @@ function bindListeners() {
         globalThis.visualViewport.addEventListener('resize', () => positionChevron());
         globalThis.visualViewport.addEventListener('scroll', () => positionChevron());
     }
-    // Filet de sécurité : le champ peut être vidé/rempli par ST ou une autre extension sans événement
+    // Filet de sécurité : `textarea.value = ''` (envoi, autre extension) ne déclenche aucun événement.
+    // Poll léger toutes les 250 ms ; hors focus, une fois sur 3 seulement.
+    let tick = 0;
     setInterval(() => {
         const ta = getTextarea();
         if (!ta) return;
+        tick++;
+        if (!state.focused && tick % 3 !== 0) return;
         if (hasTextNow() !== state.hasText) update();
-    }, 700);
+    }, POLL_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +502,11 @@ function buildSettingsHtml() {
       </div>
       <div class="te-block">
         <label class="checkbox_label"><input type="checkbox" id="te_keep"><span>Garder cachés tant qu'il y a du texte</span></label>
-        <div class="te-hint">Désactivé : les boutons ne sont cachés que pendant le focus (« Seulement pendant le focus »).</div>
+        <div class="te-hint">Les boutons reviennent dès que le champ est vide. Désactivé : cachés seulement quand il y a du texte ET que le champ a le focus.</div>
+      </div>
+      <div class="te-block">
+        <label class="checkbox_label"><input type="checkbox" id="te_focus"><span>Cacher dès le focus</span></label>
+        <div class="te-hint">Désactivé (défaut) : cachés dès le premier caractère. Activé : cachés dès le focus ; ils reviennent quand le texte est effacé et ne se re-cachent qu'à la prochaine saisie.</div>
       </div>
       <div class="te-block">
         <label class="checkbox_label"><input type="checkbox" id="te_auto"><span>Détecter automatiquement</span></label>
@@ -515,6 +543,7 @@ function syncUi() {
     const s = getSettings();
     $('#te_enabled').prop('checked', s.enabled);
     $('#te_keep').prop('checked', s.keepWhileText);
+    $('#te_focus').prop('checked', s.hideOnFocus);
     $('#te_auto').prop('checked', s.autoDetect);
     $('#te_selectors').val(s.selectors);
     $('#te_exclude').val(s.exclude);
@@ -535,6 +564,7 @@ function bindUi() {
     };
     $('#te_enabled').on('change', function () { s.enabled = !!$(this).prop('checked'); change(true); });
     $('#te_keep').on('change', function () { s.keepWhileText = !!$(this).prop('checked'); change(false); });
+    $('#te_focus').on('change', function () { s.hideOnFocus = !!$(this).prop('checked'); state.sentReset = false; change(false); });
     $('#te_auto').on('change', function () {
         s.autoDetect = !!$(this).prop('checked');
         if (!s.autoDetect) { const f = getForm(); if (f) clearMarks(f); }
@@ -617,4 +647,4 @@ if (globalThis.jQuery) {
 }
 
 // Exposé uniquement pour les tests Node (sans effet dans SillyTavern)
-export const __test = { clampNumber, splitTopLevel, sanitizeSelectors, computeBaseHide, computeHide, buildCss, braceBalance, markLeftSiblings, clearMarks, getSettings, defaultSettings };
+export const __test = { clampNumber, splitTopLevel, sanitizeSelectors, computeBaseHide, computeHide, buildCss, braceBalance, markLeftSiblings, clearMarks, getSettings, defaultSettings, scheduleAfterSend, resetState, update };

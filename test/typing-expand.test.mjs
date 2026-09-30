@@ -73,17 +73,25 @@ assert.deepEqual(t.sanitizeSelectors('#a\n\n  .b \n#a\n// c\n}bad{\n:::nope\n@im
 assert.deepEqual(t.sanitizeSelectors(42, valid), []);
 assert.deepEqual(t.splitTopLevel('a, b:not(.c, .d), [x="1,2"]'), ['a', 'b:not(.c, .d)', '[x="1,2"]']);
 
-// logique
+// logique (défaut : caché si texte, restauré si vide même avec le focus)
 const S = { ...t.defaultSettings };
-assert.equal(t.computeBaseHide(S, { focused: true, hasText: false }, false), true);
+assert.equal(S.hideOnFocus, false);
+assert.equal(t.computeBaseHide(S, { focused: true, hasText: false }, false), false);
+assert.equal(t.computeBaseHide(S, { focused: true, hasText: true }, false), true);
 assert.equal(t.computeBaseHide(S, { focused: false, hasText: true }, false), true);
 assert.equal(t.computeBaseHide(S, { focused: false, hasText: false }, false), false);
 assert.equal(t.computeBaseHide({ ...S, keepWhileText: false }, { focused: false, hasText: true }, false), false);
-assert.equal(t.computeBaseHide(S, { focused: true, hasText: false, sentReset: true }, false), false);
-assert.equal(t.computeBaseHide({ ...S, onlySmall: true }, { focused: true }, false), false);
-assert.equal(t.computeBaseHide({ ...S, onlySmall: true }, { focused: true }, true), true);
-assert.equal(t.computeBaseHide({ ...S, enabled: false }, { focused: true }, true), false);
-assert.equal(t.computeHide(S, { focused: true, forced: true }, false), false);
+assert.equal(t.computeBaseHide({ ...S, keepWhileText: false }, { focused: true, hasText: true }, false), true);
+assert.equal(t.computeBaseHide({ ...S, onlySmall: true }, { focused: true, hasText: true }, false), false);
+assert.equal(t.computeBaseHide({ ...S, onlySmall: true }, { focused: true, hasText: true }, true), true);
+assert.equal(t.computeBaseHide({ ...S, enabled: false }, { focused: true, hasText: true }, true), false);
+assert.equal(t.computeHide(S, { focused: true, hasText: true, forced: true }, false), false);
+// « Cacher dès le focus »
+const SF = { ...S, hideOnFocus: true };
+assert.equal(t.computeBaseHide(SF, { focused: true, hasText: false }, false), true);
+assert.equal(t.computeBaseHide(SF, { focused: true, hasText: false, sentReset: true }, false), false);
+assert.equal(t.computeBaseHide(SF, { focused: true, hasText: true, sentReset: false }, false), true);
+assert.equal(t.computeBaseHide(SF, { focused: false, hasText: false }, false), false);
 
 // CSS
 const css = t.buildCss(S, ['#leftSendForm', '#options_button', '#extensionsMenuButton']);
@@ -94,26 +102,125 @@ for (const needle of ['#leftSendForm', '.te-hide-left', 'width:0 !important', '#
 globalThis.__settings['typing-expand'] = { duration: 9999, selectors: 5, enabled: false };
 const s = t.getSettings();
 assert.equal(s.duration, 500); assert.equal(s.enabled, false); assert.equal(s.keepWhileText, true);
-assert.equal(s.selectors, '#leftSendForm\n#options_button\n#extensionsMenuButton'); assert.equal(s.onlySmall, false); assert.equal(s.chevron, true);
+assert.equal(s.hideOnFocus, false); assert.equal(s.selectors, '#leftSendForm\n#options_button\n#extensionsMenuButton'); assert.equal(s.onlySmall, false); assert.equal(s.chevron, true);
 
-// intégration : focus -> te-typing, blur + vide -> restauré
-globalThis.__settings['typing-expand'] = { duration: 0 };
-document.body.innerHTML = SEND;
-const form = document.getElementById('send_form');
-const ta = document.getElementById('send_textarea');
+// intégration
+const DW = dom.window;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-ta.focus();
-await sleep(50);
-assert.ok(form.classList.contains('te-typing'), 'caché au focus');
-assert.ok(document.getElementById('leftSendForm').classList.contains('te-hide-left'));
-assert.ok(!document.getElementById('rightSendForm').classList.contains('te-hide-left'));
-ta.value = 'salut'; ta.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
-ta.blur();
-await sleep(200);
-assert.ok(form.classList.contains('te-typing'), 'reste caché avec du texte');
-ta.value = ''; ta.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
-await sleep(50);
-assert.ok(!form.classList.contains('te-typing'), 'restauré quand vide et sans focus');
+const typed = (ta, v, type = 'input') => { ta.value = v; ta.dispatchEvent(new DW.Event(type, { bubbles: true })); };
+const setup = (settings) => {
+    globalThis.__settings['typing-expand'] = { duration: 0, ...settings };
+    document.body.innerHTML = SEND;
+    t.resetState();
+    document.getElementById('send_form').getBoundingClientRect = () => ({ left: 0, top: 500, width: 400, height: 40 }); // jsdom : rect vide par défaut
+    return { form: document.getElementById('send_form'), ta: document.getElementById('send_textarea'), left: document.getElementById('leftSendForm') };
+};
+const hidden = (form) => form.classList.contains('te-typing');
+
+// 1) défaut : focus sur champ vide => boutons normaux ; 1er caractère => cachés
+{
+    const { form, ta, left } = setup({});
+    ta.focus(); await sleep(50);
+    assert.ok(!hidden(form), 'défaut : champ vide + focus => visibles');
+    typed(ta, 's');
+    assert.ok(hidden(form), 'texte tapé => cachés');
+    assert.ok(left.classList.contains('te-hide-left'));
+    assert.ok(!document.getElementById('rightSendForm').classList.contains('te-hide-left'));
+    typed(ta, 'salut');
+    assert.ok(hidden(form));
+
+    // 2) effacement par l'utilisateur (input), champ toujours focus => restauré immédiatement
+    typed(ta, '');
+    assert.equal(document.activeElement, ta, 'toujours focus');
+    assert.ok(!hidden(form), 'effacé par input => restauré alors que focus');
+    // idem keyup seul / cut / change (iOS)
+    typed(ta, 'abc'); assert.ok(hidden(form));
+    typed(ta, '', 'keyup'); assert.ok(!hidden(form), 'keyup => restauré');
+    typed(ta, 'abc'); assert.ok(hidden(form));
+    typed(ta, '', 'change'); assert.ok(!hidden(form), 'change => restauré');
+    typed(ta, 'abc', 'compositionend'); assert.ok(hidden(form), 'compositionend => caché');
+    ta.value = ''; ta.dispatchEvent(new DW.Event('cut', { bubbles: true }));
+    await sleep(20);
+    assert.ok(!hidden(form), 'cut => restauré');
+    // espaces seuls = vide
+    typed(ta, '   '); assert.ok(!hidden(form), 'espaces seuls = vide');
+
+    // 3) effacement programmatique (value = '' sans événement) => poll
+    typed(ta, 'bonjour'); assert.ok(hidden(form));
+    ta.value = '';
+    await sleep(400);
+    assert.ok(!hidden(form), 'value="" sans événement => restauré par le poll');
+    // et remplissage programmatique => caché par le poll
+    ta.value = 'auto';
+    await sleep(400);
+    assert.ok(hidden(form), 'value programmatique => caché par le poll');
+    ta.value = ''; await sleep(400);
+    assert.ok(!hidden(form));
+
+    // 4) blur avec texte : reste caché (keepWhileText) ; restauré quand vidé sans focus
+    typed(ta, 'texte'); ta.blur(); await sleep(200);
+    assert.ok(hidden(form), 'blur avec texte => reste caché');
+    typed(ta, ''); await sleep(20);
+    assert.ok(!hidden(form), 'vidé sans focus => restauré');
+    ta.focus(); await sleep(50); assert.ok(!hidden(form));
+
+    // chevron : bascule boutons visibles / cachés tant que texte
+    typed(ta, 'hey'); assert.ok(hidden(form));
+    const chev = document.getElementById('te_chevron');
+    assert.ok(chev && chev.classList.contains('te-show'), 'chevron visible');
+    chev.dispatchEvent(new DW.MouseEvent('click', { bubbles: true, cancelable: true }));
+    assert.ok(!hidden(form), 'chevron => boutons ré-affichés');
+    chev.dispatchEvent(new DW.MouseEvent('click', { bubbles: true, cancelable: true }));
+    assert.ok(hidden(form), 'chevron => re-cachés');
+    typed(ta, ''); assert.ok(!hidden(form));
+    assert.ok(!chev.classList.contains('te-show'), 'chevron masqué quand vide');
+
+    // 5) envoi (MESSAGE_SENT-like) : champ vidé sans événement puis scheduleAfterSend
+    typed(ta, 'envoyer');
+    assert.ok(hidden(form));
+    ta.value = '';
+    t.scheduleAfterSend();
+    await sleep(100);
+    assert.ok(!hidden(form), 'après envoi => restauré');
+    typed(ta, 'suite'); assert.ok(hidden(form), 'nouvelle saisie => caché');
+}
+
+// 6) keepWhileText = false : blur avec texte => restauré
+{
+    const { form, ta } = setup({ keepWhileText: false });
+    ta.focus(); await sleep(50);
+    typed(ta, 'x'); assert.ok(hidden(form));
+    ta.blur(); await sleep(200);
+    assert.ok(!hidden(form), 'keepWhileText off : blur => visibles');
+}
+
+// 7) « Cacher dès le focus » ON
+{
+    const { form, ta } = setup({ hideOnFocus: true });
+    ta.blur(); await sleep(150);
+    ta.focus(); await sleep(50);
+    assert.ok(hidden(form), 'hideOnFocus : caché dès le focus');
+    typed(ta, 'abc'); assert.ok(hidden(form));
+    typed(ta, '');
+    assert.equal(document.activeElement, ta);
+    assert.ok(!hidden(form), 'hideOnFocus : texte effacé => restauré (focus conservé)');
+    await sleep(400);
+    assert.ok(!hidden(form), 'pas re-caché par le poll ni autre');
+    typed(ta, '', 'keyup'); assert.ok(!hidden(form), 'pas re-caché avant saisie');
+    typed(ta, 'z'); assert.ok(hidden(form), 'prochaine saisie => caché');
+    // effacement programmatique
+    ta.value = ''; await sleep(400);
+    assert.ok(!hidden(form), 'hideOnFocus : value="" => restauré par le poll');
+    // blur avec texte : reste caché
+    typed(ta, 'q'); ta.blur(); await sleep(200);
+    assert.ok(hidden(form), 'hideOnFocus : blur avec texte => reste caché');
+    // envoi
+    ta.value = ''; t.scheduleAfterSend(); await sleep(100);
+    assert.ok(!hidden(form), 'hideOnFocus : après envoi => restauré');
+    // nouveau focus => caché de nouveau
+    ta.focus(); await sleep(50);
+    assert.ok(hidden(form), 'hideOnFocus : refocus => caché');
+}
 
 console.log('typing-expand: tous les tests OK');
 process.exit(0);
